@@ -13,7 +13,7 @@
   function clone(x) { return JSON.parse(JSON.stringify(x)); }
 
   function seed() {
-    var db = { seq: 100, exercises: [], templates: [], workouts: [], devices: [], state: {} };
+    var db = { seq: 100, exercises: [], templates: [], workouts: [], devices: [], state: {}, bodyWeights: [] };
     var ex = [
       ['Bench press', 0, ['bench']], ['Wide-grip lat pulldown', 0, ['lat pulldown wide']], ['Dumbbell shoulder press', 0, []],
       ['Cable row', 0, ['seated row']], ['Dumbbell lateral raise', 0, ['lat raise']], ['Cable biceps curl', 0, []],
@@ -46,12 +46,19 @@
       });
       db.workouts.push(w);
     });
+    db.workouts.forEach(function (w) { if (w.bodyWeightKg != null) db.bodyWeights.push({ id: ++db.seq, date: w.date, weightKg: w.bodyWeightKg }); });
     return db;
+  }
+
+  function upsertBw(date, kg) {
+    var e = db.bodyWeights.filter(function (x) { return x.date === date; })[0];
+    if (e) e.weightKg = kg; else db.bodyWeights.push({ id: ++db.seq, date: date, weightKg: kg });
   }
 
   var db;
   try { db = JSON.parse(localStorage.getItem(KEY)); } catch (e) { db = null; }
   if (!db) db = seed();
+  if (!db.bodyWeights) db.bodyWeights = [];
   function persist() { try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) { } }
   persist();
 
@@ -98,13 +105,13 @@
       var ws = db.workouts.slice().sort(byDateDesc);
       var last = ws[0];
       var lastT = ws.filter(function (w) { return w.templateId; })[0];
-      var lastBw = ws.filter(function (w) { return w.bodyWeightKg != null; })[0];
+      var lastBw = db.bodyWeights.slice().sort(function (a, b) { return a.date < b.date ? 1 : -1; })[0];
       return {
         exercises: clone(db.exercises).sort(function (a, b) { return a.name.localeCompare(b.name); }),
         templates: clone(db.templates.filter(function (t) { return !t.archived; })).sort(function (a, b) { return a.position - b.position; }),
         lastWorkout: last ? { date: last.date, templateId: last.templateId, templateName: last.templateId ? tplById(last.templateId).name : null } : null,
         lastTemplateId: lastT ? lastT.templateId : null,
-        lastBodyWeightKg: lastBw ? lastBw.bodyWeightKg : null,
+        lastBodyWeightKg: lastBw ? lastBw.weightKg : null,
         workoutCount: ws.length
       };
     },
@@ -142,6 +149,7 @@
       if (!w) { w = { id: ++db.seq, clientId: b.clientId || null, startedAt: b.startedAt || null, endedAt: b.endedAt || now }; db.workouts.push(w); }
       else { w.startedAt = w.startedAt || b.startedAt || null; w.endedAt = w.endedAt || b.endedAt || now; }
       w.date = b.date; w.templateId = b.templateId || null; w.comment = b.comment || null; w.bodyWeightKg = num(b.bodyWeightKg); w.updatedAt = now;
+      if (w.bodyWeightKg != null) upsertBw(w.date, w.bodyWeightKg);
       w.exercises = (b.exercises || []).map(function (e) {
         var id = e.exerciseId || findOrCreate(e.name, e.kind);
         return { exerciseId: id, comment: e.comment || null, nextTarget: e.nextTarget || null, sets: (e.sets || []).map(function (s) {
@@ -198,12 +206,13 @@
       });
       totals.perWeekLast4 = Math.round(c28 / 4 * 10) / 10;
       if (durs.length) totals.avgDurationMin = Math.round(durs.reduce(function (a, b) { return a + b; }, 0) / durs.length);
-      var bwRows = ws.filter(function (w) { return w.bodyWeightKg != null; });
-      var body = {};
+      var bwRows = db.bodyWeights.slice().sort(function (a, b) { return a.date < b.date ? -1 : 1; });
+      var body = { history: bwRows.slice().reverse() };
       if (bwRows.length) {
         var latest = bwRows[bwRows.length - 1];
         var first30 = bwRows.filter(function (w) { return w.date >= back30; })[0];
-        body = { latestKg: latest.bodyWeightKg, latestDate: latest.date, change30Kg: first30 && first30 !== latest ? Math.round((latest.bodyWeightKg - first30.bodyWeightKg) * 100) / 100 : null };
+        body.latestKg = latest.weightKg; body.latestDate = latest.date;
+        body.change30Kg = first30 && first30 !== latest ? Math.round((latest.weightKg - first30.weightKg) * 100) / 100 : null;
       }
       var per = {};
       ws.forEach(function (w) {
@@ -227,6 +236,39 @@
     },
     backup: function () { return clone(db); },
     devices: function () { return { devices: clone(db.devices), maxDevices: 3, enrollOpen: false }; },
+    'bodyweight-save': function (p, b) { var kg = num(b.weightKg); if (kg == null || kg < 20 || kg > 300) throw err(400, 'Body weight must be between 20 and 300.'); upsertBw(b.date, kg); persist(); return { ok: true }; },
+    'bodyweight-delete': function (p, b) { db.bodyWeights = db.bodyWeights.filter(function (x) { return x.id !== b.id; }); persist(); return { ok: true }; },
+    import: function (p, b) {
+      if (b.format !== 'gym-helper-import-1') throw err(400, 'This is not a gym-helper import file.');
+      var r = { exercisesAdded: 0, aliasesAdded: 0, templatesAdded: 0, workoutsAdded: 0, workoutsSkipped: 0, setsAdded: 0, bodyWeightsAdded: 0 };
+      function find(n) { n = n.toLocaleLowerCase(); return db.exercises.filter(function (x) { return x.name.toLocaleLowerCase() === n || x.aliases.some(function (a) { return a.toLocaleLowerCase() === n; }); })[0]; }
+      (b.exercises || []).forEach(function (e) {
+        var x = find(e.name);
+        if (!x) { x = { id: ++db.seq, name: e.name, kind: e.kind || 0, archived: false, aliases: [] }; db.exercises.push(x); r.exercisesAdded++; }
+        (e.aliases || []).forEach(function (a) { if (!find(a)) { x.aliases.push(a); r.aliasesAdded++; } });
+      });
+      (b.templates || []).forEach(function (t) {
+        if (db.templates.some(function (x) { return x.name.toLocaleLowerCase() === t.name.toLocaleLowerCase(); })) return;
+        db.templates.push({ id: ++db.seq, name: t.name, position: db.templates.length + 1, archived: false, exerciseIds: t.exercises.map(function (n) { return findOrCreate(n, 0); }) });
+        r.templatesAdded++;
+      });
+      (b.bodyWeights || []).forEach(function (x) { upsertBw(x.date, x.weightKg); r.bodyWeightsAdded++; });
+      (b.workouts || []).forEach(function (w) {
+        if (w.clientId && db.workouts.some(function (x) { return x.clientId === w.clientId; })) { r.workoutsSkipped++; return; }
+        var tp = w.template ? db.templates.filter(function (x) { return x.name === w.template; })[0] : null;
+        var now = new Date().toISOString();
+        db.workouts.push({ id: ++db.seq, clientId: w.clientId || null, date: w.date, templateId: tp ? tp.id : null, comment: w.comment || null,
+          bodyWeightKg: w.bodyWeightKg == null ? null : w.bodyWeightKg, startedAt: null, endedAt: null, updatedAt: now,
+          exercises: (w.exercises || []).map(function (e) {
+            var sets = (e.sets || []).filter(function (s) { return s.reps != null || s.durationSec != null; }).map(function (s) {
+              r.setsAdded++; return { weightKg: s.weightKg == null ? null : s.weightKg, reps: s.reps == null ? null : s.reps, durationSec: s.durationSec == null ? null : s.durationSec, restSec: s.restSec || null, formBroke: !!s.formBroke, note: s.note || null };
+            });
+            return { exerciseId: findOrCreate(e.name, e.kind || 0), comment: e.comment || null, nextTarget: e.nextTarget || null, sets: sets };
+          }) });
+        r.workoutsAdded++;
+      });
+      persist(); return r;
+    },
     'device-delete': function (p, b) { db.devices = db.devices.filter(function (d) { return d.id !== b.id; }); persist(); return { ok: true }; }
   };
 

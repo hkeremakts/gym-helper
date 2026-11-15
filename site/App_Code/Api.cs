@@ -42,7 +42,10 @@ public static class Api
         { "template-save", TemplateSave },
         { "template-delete", TemplateDelete },
         { "export-mark", ExportMark },
-        { "device-delete", DeviceDelete }
+        { "device-delete", DeviceDelete },
+        { "bodyweight-save", BodyWeightSave },
+        { "bodyweight-delete", BodyWeightDelete },
+        { "import", Import }
     };
 
     public static void Handle(HttpContext ctx)
@@ -181,8 +184,7 @@ public static class Api
 
         d["lastTemplateId"] = Db.Scalar(q.C, null,
             "SELECT TOP 1 template_id FROM workouts WHERE template_id IS NOT NULL ORDER BY [date] DESC, id DESC");
-        d["lastBodyWeightKg"] = Db.Scalar(q.C, null,
-            "SELECT TOP 1 body_weight_kg FROM workouts WHERE body_weight_kg IS NOT NULL ORDER BY [date] DESC, id DESC");
+        d["lastBodyWeightKg"] = Db.Scalar(q.C, null, "SELECT TOP 1 weight_kg FROM body_weights ORDER BY [date] DESC");
         d["workoutCount"] = Db.Scalar(q.C, null, "SELECT COUNT(*) FROM workouts");
         return d;
     }
@@ -562,6 +564,8 @@ public static class Api
                     Db.P("@s", startedAt), Db.P("@e", endedAt ?? now), Db.P("@c", clientId), Db.P("@now", now));
             }
 
+            if (bw != null) UpsertBodyWeight(q.C, t, date.Value, bw.Value);
+
             for (int i = 0; i < exercises.Count; i++)
             {
                 var e = exercises[i];
@@ -667,18 +671,28 @@ public static class Api
         totals["perWeekLast4"] = Math.Round(last28 / 4.0, 1);
         totals["avgDurationMin"] = durations.Count == 0 ? (object)null : (int)Math.Round(durations.Average());
 
-        var bwRows = ws.Where(w => w["body_weight_kg"] != null).ToList();
+        var bwRows = Db.Rows(q.C, null, "SELECT id, [date], weight_kg FROM body_weights ORDER BY [date]");
         var body = D();
+        var history = new List<object>();
         if (bwRows.Count > 0)
         {
             var latest = bwRows[bwRows.Count - 1];
-            body["latestKg"] = latest["body_weight_kg"];
+            body["latestKg"] = latest["weight_kg"];
             body["latestDate"] = Http.DateStr(latest["date"]);
             var first30 = bwRows.FirstOrDefault(w => (DateTime)w["date"] >= today.AddDays(-30));
             body["change30Kg"] = (first30 != null && first30 != latest)
-                ? (object)((decimal)latest["body_weight_kg"] - (decimal)first30["body_weight_kg"])
+                ? (object)((decimal)latest["weight_kg"] - (decimal)first30["weight_kg"])
                 : null;
+            for (int i = bwRows.Count - 1; i >= 0; i--)
+            {
+                var h = D();
+                h["id"] = Convert.ToInt32(bwRows[i]["id"]);
+                h["date"] = Http.DateStr(bwRows[i]["date"]);
+                h["weightKg"] = bwRows[i]["weight_kg"];
+                history.Add(h);
+            }
         }
+        body["history"] = history;
 
         var sets = Db.Rows(q.C, null, @"SELECT e.id AS exercise_id, e.name, e.kind, w.id AS workout_id, w.[date], s.weight_kg, s.reps, s.duration_sec
             FROM sets s JOIN workout_exercises we ON we.id = s.workout_exercise_id
@@ -737,7 +751,7 @@ public static class Api
         var d = D();
         d["format"] = "gym-helper-backup-1";
         d["exportedAt"] = Http.UtcStr(DateTime.UtcNow);
-        foreach (string table in new[] { "exercises", "exercise_aliases", "templates", "template_exercises", "workouts", "workout_exercises", "sets", "app_state" })
+        foreach (string table in new[] { "exercises", "exercise_aliases", "templates", "template_exercises", "workouts", "workout_exercises", "sets", "body_weights", "app_state" })
         {
             var rows = Db.Rows(q.C, null, "SELECT * FROM " + table); // table names are fixed above, never user input
             foreach (var r in rows)
@@ -776,5 +790,160 @@ public static class Api
     {
         Db.Exec(q.C, null, "DELETE FROM devices WHERE id = @id", Db.P("@id", IdFromBody(q)));
         var d = D(); d["ok"] = true; return d;
+    }
+
+    // ===== Body weight history ==============================================================
+
+    static void UpsertBodyWeight(SqlConnection c, SqlTransaction t, DateTime date, decimal kg)
+    {
+        Db.Exec(c, t, @"IF EXISTS (SELECT 1 FROM body_weights WHERE [date] = @d)
+                UPDATE body_weights SET weight_kg = @w, updated_at = @now WHERE [date] = @d
+            ELSE INSERT INTO body_weights ([date], weight_kg, updated_at) VALUES (@d, @w, @now)",
+            Db.P("@d", date), Db.P("@w", kg), Db.P("@now", DateTime.UtcNow));
+    }
+
+    static object BodyWeightSave(Req q)
+    {
+        DateTime? date = Http.ParseDate(Http.Str(q.Body, "date", 10), "date");
+        if (date == null) throw new ApiException("A date is needed.");
+        decimal? kg = Http.Dec(q.Body, "weightKg");
+        if (kg == null) throw new ApiException("A weight is needed.");
+        CheckRange(kg, 20, 300, "Body weight");
+        UpsertBodyWeight(q.C, null, date.Value, kg.Value);
+        var d = D(); d["ok"] = true; return d;
+    }
+
+    static object BodyWeightDelete(Req q)
+    {
+        Db.Exec(q.C, null, "DELETE FROM body_weights WHERE id = @id", Db.P("@id", IdFromBody(q)));
+        var d = D(); d["ok"] = true; return d;
+    }
+
+    // ===== Import ===========================================================================
+    // Format "gym-helper-import-1":
+    // { format, exercises: [{ name, kind, aliases: [] }], templates: [{ name, exercises: [names] }],
+    //   bodyWeights: [{ date, weightKg }],
+    //   workouts: [{ clientId, date, template, comment, bodyWeightKg,
+    //                exercises: [{ name, kind, comment, nextTarget, sets: [{ weightKg, reps, durationSec, restSec, formBroke, note }] }] }] }
+    // Safe to run twice: exercises and templates are matched by name, workouts by clientId.
+
+    static object Import(Req q)
+    {
+        var b = q.Body;
+        if (Http.Str(b, "format", 50) != "gym-helper-import-1") throw new ApiException("This is not a gym-helper import file.");
+        int exAdded = 0, aliasAdded = 0, tplAdded = 0, wAdded = 0, wSkipped = 0, setsAdded = 0, bwAdded = 0;
+
+        using (SqlTransaction t = q.C.BeginTransaction())
+        {
+            foreach (object o in Http.List(b, "exercises"))
+            {
+                var e = Http.Obj(o, "exercise");
+                string name = Http.Str(e, "name", 100);
+                if (name == null) continue;
+                int kind = Http.Int(e, "kind") ?? 0;
+                if (kind < 0 || kind > 2) kind = 0;
+                object found = Db.Scalar(q.C, t, "SELECT id FROM exercises WHERE name = @n", Db.P("@n", name));
+                if (found == null) found = Db.Scalar(q.C, t, "SELECT exercise_id FROM exercise_aliases WHERE alias = @n", Db.P("@n", name));
+                int id;
+                if (found == null)
+                {
+                    id = Db.Insert(q.C, t, "INSERT INTO exercises (name, kind, archived) VALUES (@n, @k, 0)", Db.P("@n", name), Db.P("@k", kind));
+                    exAdded++;
+                }
+                else id = Convert.ToInt32(found);
+                foreach (object a in Http.List(e, "aliases"))
+                {
+                    string alias = a == null ? null : Convert.ToString(a, CultureInfo.InvariantCulture).Trim();
+                    if (string.IsNullOrEmpty(alias) || alias.Length > 100) continue;
+                    bool taken = Db.Scalar(q.C, t, "SELECT 1 FROM exercises WHERE name = @a", Db.P("@a", alias)) != null
+                              || Db.Scalar(q.C, t, "SELECT 1 FROM exercise_aliases WHERE alias = @a", Db.P("@a", alias)) != null;
+                    if (taken) continue;
+                    Db.Exec(q.C, t, "INSERT INTO exercise_aliases (exercise_id, alias) VALUES (@e, @a)", Db.P("@e", id), Db.P("@a", alias));
+                    aliasAdded++;
+                }
+            }
+
+            var tplIds = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            foreach (var r in Db.Rows(q.C, t, "SELECT id, name FROM templates")) tplIds[(string)r["name"]] = Convert.ToInt32(r["id"]);
+            foreach (object o in Http.List(b, "templates"))
+            {
+                var tp = Http.Obj(o, "template");
+                string name = Http.Str(tp, "name", 50);
+                if (name == null || tplIds.ContainsKey(name)) continue;
+                int pos = Convert.ToInt32(Db.Scalar(q.C, t, "SELECT ISNULL(MAX(position), 0) + 1 FROM templates"));
+                int tid = Db.Insert(q.C, t, "INSERT INTO templates (name, position, archived) VALUES (@n, @p, 0)", Db.P("@n", name), Db.P("@p", pos));
+                tplIds[name] = tid;
+                tplAdded++;
+                var names = Http.List(tp, "exercises");
+                for (int i = 0; i < names.Count; i++)
+                {
+                    string en = Convert.ToString(names[i], CultureInfo.InvariantCulture);
+                    int exId = FindOrCreateExercise(q.C, t, en, 0);
+                    Db.Exec(q.C, t, "INSERT INTO template_exercises (template_id, exercise_id, position) VALUES (@t, @e, @p)",
+                        Db.P("@t", tid), Db.P("@e", exId), Db.P("@p", i));
+                }
+            }
+
+            foreach (object o in Http.List(b, "bodyWeights"))
+            {
+                var bwi = Http.Obj(o, "bodyWeight");
+                DateTime? d = Http.ParseDate(Http.Str(bwi, "date", 10), "date");
+                decimal? kg = Http.Dec(bwi, "weightKg");
+                if (d == null || kg == null) continue;
+                CheckRange(kg, 20, 300, "Body weight");
+                UpsertBodyWeight(q.C, t, d.Value, kg.Value);
+                bwAdded++;
+            }
+
+            DateTime now = DateTime.UtcNow;
+            foreach (object o in Http.List(b, "workouts"))
+            {
+                var w = Http.Obj(o, "workout");
+                string clientId = Http.Str(w, "clientId", 36);
+                if (clientId != null && Db.Scalar(q.C, t, "SELECT 1 FROM workouts WHERE client_id = @c", Db.P("@c", clientId)) != null) { wSkipped++; continue; }
+                DateTime? date = Http.ParseDate(Http.Str(w, "date", 10), "date");
+                if (date == null) throw new ApiException("A workout in the file has no date.");
+                string tplName = Http.Str(w, "template", 50);
+                object tplId = (tplName != null && tplIds.ContainsKey(tplName)) ? (object)tplIds[tplName] : null;
+                decimal? bw = Http.Dec(w, "bodyWeightKg");
+                int wid = Db.Insert(q.C, t, @"INSERT INTO workouts ([date], template_id, comment, body_weight_kg, client_id, created_at, updated_at)
+                    VALUES (@d, @t, @c, @bw, @cid, @now, @now)",
+                    Db.P("@d", date.Value), Db.P("@t", tplId), Db.P("@c", Http.Str(w, "comment", 4000)), Db.P("@bw", bw),
+                    Db.P("@cid", clientId), Db.P("@now", now));
+                if (bw != null) UpsertBodyWeight(q.C, t, date.Value, bw.Value);
+                wAdded++;
+
+                var exs = Http.List(w, "exercises");
+                for (int i = 0; i < exs.Count; i++)
+                {
+                    var e = Http.Obj(exs[i], "exercise");
+                    string name = Http.Str(e, "name", 100);
+                    if (name == null) throw new ApiException("An exercise in the file has no name.");
+                    int exId = FindOrCreateExercise(q.C, t, name, Http.Int(e, "kind") ?? 0);
+                    int weId = Db.Insert(q.C, t, @"INSERT INTO workout_exercises (workout_id, exercise_id, position, comment, next_target)
+                        VALUES (@w, @e, @p, @c, @n)",
+                        Db.P("@w", wid), Db.P("@e", exId), Db.P("@p", i), Db.P("@c", Http.Str(e, "comment", 4000)), Db.P("@n", Http.Str(e, "nextTarget", 200)));
+                    var sets = Http.List(e, "sets");
+                    for (int j = 0; j < sets.Count; j++)
+                    {
+                        var s = Http.Obj(sets[j], "set");
+                        decimal? reps = Http.Dec(s, "reps");
+                        int? dur = Http.Int(s, "durationSec");
+                        if (reps == null && dur == null) continue;
+                        Db.Exec(q.C, t, @"INSERT INTO sets (workout_exercise_id, position, weight_kg, reps, duration_sec, note, rest_sec, form_broke)
+                            VALUES (@we, @p, @w, @r, @d, @n, @rs, @f)",
+                            Db.P("@we", weId), Db.P("@p", j), Db.P("@w", Http.Dec(s, "weightKg")), Db.P("@r", reps), Db.P("@d", dur),
+                            Db.P("@n", Http.Str(s, "note", 200)), Db.P("@rs", Http.Int(s, "restSec")), Db.P("@f", Http.Bool(s, "formBroke")));
+                        setsAdded++;
+                    }
+                }
+            }
+            t.Commit();
+        }
+
+        var res = D();
+        res["exercisesAdded"] = exAdded; res["aliasesAdded"] = aliasAdded; res["templatesAdded"] = tplAdded;
+        res["workoutsAdded"] = wAdded; res["workoutsSkipped"] = wSkipped; res["setsAdded"] = setsAdded; res["bodyWeightsAdded"] = bwAdded;
+        return res;
     }
 }

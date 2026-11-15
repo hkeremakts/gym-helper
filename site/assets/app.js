@@ -49,7 +49,11 @@
       ex_log_title: '# Antrenman günlüğü — {from} – {to} ({n} antrenman)', ex_duration: 'Süre: {n} dk', ex_bw: 'Kilo: {n} kg',
       ex_rest: 'dinlenme', ex_next: 'hedef', ex_comment: 'yorum', ex_session: 'Antrenman yorumu', ex_question: 'Sorum / yorumum:',
       mock_mode: 'Deneme modu: uydurma veriler, sunucu yok.',
-      finish_first: 'Önce açık antrenmanı kaydet ya da sil.'
+      finish_first: 'Önce açık antrenmanı kaydet ya da sil.',
+      bw_saved: 'Kilo kaydedildi', bw_history: 'Kilo geçmişi', bw_add: 'Kilo ekle', bw_none: 'Henüz kilo kaydı yok.',
+      import_title: 'İçe aktar', import_help: 'Bir içe aktarma dosyası (.json) seç. İki kez yüklemek kopya oluşturmaz.',
+      import_btn: 'İçe aktar', import_choose: 'Önce bir dosya seç.', import_bad: 'Dosya okunamadı: geçerli bir JSON değil.',
+      import_done: '{w} antrenman, {s} set, {e} hareket, {t} şablon eklendi. {k} antrenman zaten vardı.'
     },
     en: {
       tab_log: 'Log', tab_history: 'History', tab_stats: 'Stats', tab_export: 'Export',
@@ -96,7 +100,11 @@
       ex_log_title: '# Workout log — {from} to {to} ({n} workouts)', ex_duration: 'Duration: {n} min', ex_bw: 'Body weight: {n} kg',
       ex_rest: 'rest', ex_next: 'next time', ex_comment: 'comment', ex_session: 'Session comment', ex_question: 'My question / comment:',
       mock_mode: 'Demo mode: made-up data, no server.',
-      finish_first: 'Save or discard the open workout first.'
+      finish_first: 'Save or discard the open workout first.',
+      bw_saved: 'Body weight saved', bw_history: 'Body weight history', bw_add: 'Add body weight', bw_none: 'No body weight entries yet.',
+      import_title: 'Import', import_help: 'Choose an import file (.json). Importing the same file twice creates no duplicates.',
+      import_btn: 'Import', import_choose: 'Choose a file first.', import_bad: 'Could not read the file: not valid JSON.',
+      import_done: 'Added {w} workouts, {s} sets, {e} exercises, {t} templates. {k} workouts were already there.'
     }
   };
 
@@ -292,6 +300,18 @@
     return api('start').then(function (d) { S.start = d; }).catch(function (e) { if (e.status === 403) showLocked(); else fail(e); });
   }
 
+  // Every new body weight value becomes a dated history entry right away (one per day; the latest value wins).
+  function saveBodyWeight(date, raw) {
+    var kg = parseNum(raw);
+    if (kg == null) return;
+    if (isNaN(kg) || kg < 20 || kg > 300) { toast(t('bad_number', { v: raw }), true); return; }
+    api('bodyweight-save', null, { date: date, weightKg: kg }).then(function () {
+      toast(t('bw_saved'));
+      if (S.start) S.start.lastBodyWeightKg = kg;
+      S.stats = null;
+    }).catch(function (e) { if (!e.offline) fail(e); /* offline: the workout save carries it */ });
+  }
+
   // ===================================================================== shell
   function setTitle(key) { $('#view-title').textContent = t(key); }
 
@@ -403,7 +423,8 @@
       oninput: function () { S.startDate = dateIn.value; } });
     var bwIn = h('input', { class: 'input', inputmode: 'decimal', autocomplete: 'off',
       placeholder: st && st.lastBodyWeightKg != null ? fmt(st.lastBodyWeightKg) : '', value: S.startBw || '',
-      oninput: function () { S.startBw = bwIn.value; } });
+      oninput: function () { S.startBw = bwIn.value; },
+      onchange: function () { saveBodyWeight(dateIn.value || todayStr(), bwIn.value); } });
     main.appendChild(h('div', { class: 'section start-grid' },
       h('label', { class: 'field' }, h('span', { text: t('date') }), dateIn),
       h('label', { class: 'field' }, h('span', { text: t('body_weight') }), bwIn)));
@@ -538,7 +559,8 @@
     var commentIn = h('textarea', { class: 'textarea', placeholder: t('comment_ph'), value: d.comment,
       oninput: function () { d.comment = commentIn.value; saveDraft(); } });
     var bwIn = h('input', { class: 'input', inputmode: 'decimal', value: d.bodyWeightKg,
-      oninput: function () { d.bodyWeightKg = bwIn.value; saveDraft(); } });
+      oninput: function () { d.bodyWeightKg = bwIn.value; saveDraft(); },
+      onchange: function () { saveBodyWeight(d.date, bwIn.value); } });
     main.appendChild(h('div', { class: 'section stack' },
       h('label', { class: 'field' }, h('span', { text: t('session_comment') }), commentIn),
       h('label', { class: 'field' }, h('span', { text: t('body_weight') }), bwIn)));
@@ -962,7 +984,7 @@
     if (!S.stats || S.stats.lang !== lang) { S.stats = { data: null, lang: lang }; api('stats', { today: todayStr() }).then(function (d) { S.stats.data = d; if (S.tab === 'stats') render(); }).catch(fail); }
     var d = S.stats.data;
     if (!d) { main.appendChild(h('p', { class: 'empty', text: t('loading') })); return; }
-    if (!d.totals.allTime) { main.appendChild(h('p', { class: 'empty', text: t('stats_empty') })); return; }
+    if (!d.totals.allTime) { main.appendChild(h('p', { class: 'empty', text: t('stats_empty') })); main.appendChild(renderBodyWeight(d.bodyWeight || {})); return; }
     var tt = d.totals;
     main.appendChild(h('div', { class: 'section' }, h('h2', { text: t('stats_totals') }),
       h('dl', { class: 'facts' },
@@ -971,14 +993,7 @@
         h('dt', { text: t('all_time') }), h('dd', { text: String(tt.allTime) }),
         h('dt', { text: t('per_week') }), h('dd', { text: fmt(tt.perWeekLast4) }),
         h('dt', { text: t('avg_duration') }), h('dd', { text: tt.avgDurationMin == null ? '—' : tt.avgDurationMin + ' ' + t('min') }))));
-    var bw = d.bodyWeight || {};
-    if (bw.latestKg != null) {
-      var ch = bw.change30Kg;
-      main.appendChild(h('div', { class: 'section' }, h('h2', { text: t('stats_bw') }),
-        h('dl', { class: 'facts' },
-          h('dt', { text: t('latest') + ' (' + niceDate(bw.latestDate) + ')' }), h('dd', { text: fmt(bw.latestKg) + ' kg' }),
-          h('dt', { text: t('change_30') }), h('dd', { text: ch == null ? '—' : (ch > 0 ? '+' : '') + fmt(ch) + ' kg' }))));
-    }
+    main.appendChild(renderBodyWeight(d.bodyWeight || {}));
     var rows = d.exercises.map(function (e) {
       var b = e.best || {}, best;
       if (e.kind === 2) best = b.durationSec != null ? fmtSecs(b.durationSec) : '—';
@@ -994,6 +1009,54 @@
       h('div', { class: 'table-wrap' }, h('table', { class: 'stats' },
         h('thead', null, h('tr', null, ['col_exercise', 'col_sessions', 'col_weight', 'col_best', 'col_last'].map(function (k) { return h('th', { text: t(k) }); }))),
         h('tbody', null, rows)))));
+  }
+
+  function renderBodyWeight(bw) {
+    var sec = h('div', { class: 'section' }, h('h2', { text: t('stats_bw') }));
+    if (bw.latestKg != null) {
+      var ch = bw.change30Kg;
+      sec.appendChild(h('dl', { class: 'facts' },
+        h('dt', { text: t('latest') + ' (' + niceDate(bw.latestDate) + ')' }), h('dd', { text: fmt(bw.latestKg) + ' kg' }),
+        h('dt', { text: t('change_30') }), h('dd', { text: ch == null ? '—' : (ch > 0 ? '+' : '') + fmt(ch) + ' kg' })));
+    }
+
+    var dateIn = h('input', { class: 'input', type: 'date', value: todayStr(), max: todayStr(), 'aria-label': t('date') });
+    var kgIn = h('input', { class: 'input', inputmode: 'decimal', placeholder: 'kg', 'aria-label': t('body_weight') });
+    sec.appendChild(h('form', { class: 'stack', style: 'margin-top:12px', onsubmit: function (ev) {
+      ev.preventDefault();
+      var kg = parseNum(kgIn.value);
+      if (kg == null || isNaN(kg) || kg < 20 || kg > 300) { toast(t('bad_number', { v: kgIn.value }), true); kgIn.focus(); return; }
+      api('bodyweight-save', null, { date: dateIn.value || todayStr(), weightKg: kg }).then(function () {
+        toast(t('bw_saved')); S.stats = null; return refreshStart();
+      }).then(render).catch(fail);
+    } }, h('h2', { style: 'font-size:0.95rem', text: t('bw_add') }),
+      h('div', { class: 'start-grid' }, dateIn, kgIn),
+      h('button', { class: 'btn small', type: 'submit' }, t('save'))));
+
+    var hist = bw.history || [];
+    sec.appendChild(h('h2', { style: 'font-size:0.95rem;margin:16px 0 6px', text: t('bw_history') }));
+    if (!hist.length) { sec.appendChild(h('p', { class: 'muted small', text: t('bw_none') })); return sec; }
+    var list = h('div', { class: 'list' });
+    hist.forEach(function (e, i) {
+      var prev = hist[i + 1];
+      var diff = prev ? Math.round((e.weightKg - prev.weightKg) * 100) / 100 : null;
+      var row = h('div', { class: 'item spread', style: 'padding:6px 2px' },
+        h('span', null, niceDate(e.date)),
+        h('span', { class: 'row', style: 'gap:8px' },
+          diff != null && diff !== 0 ? h('span', { class: 'muted small', text: (diff > 0 ? '+' : '') + fmt(diff) }) : null,
+          h('strong', { text: fmt(e.weightKg) + ' kg' }),
+          h('button', { class: 'iconbtn', type: 'button', 'aria-label': t('delete'), onclick: function () { S.bwConfirm = e.id; render(); } }, icon('x'))));
+      list.appendChild(row);
+      if (S.bwConfirm === e.id) {
+        list.appendChild(h('div', { class: 'confirm', style: 'margin:6px 0' }, h('span', { style: 'flex:1', text: niceDate(e.date) + ' — ' + fmt(e.weightKg) + ' kg' }),
+          h('button', { class: 'btn small danger', type: 'button', onclick: function () {
+            api('bodyweight-delete', null, { id: e.id }).then(function () { S.bwConfirm = null; S.stats = null; toast(t('deleted')); return refreshStart(); }).then(render).catch(fail);
+          } }, t('delete')),
+          h('button', { class: 'btn small', type: 'button', onclick: function () { S.bwConfirm = null; render(); } }, t('cancel'))));
+      }
+    });
+    sec.appendChild(list);
+    return sec;
   }
 
   // ===================================================================== Export
@@ -1116,7 +1179,35 @@
     wrap.appendChild(renderTemplatesSettings());
     wrap.appendChild(renderExercisesSettings());
     wrap.appendChild(renderDevicesSettings());
+    wrap.appendChild(renderImport());
     return wrap;
+  }
+
+  function renderImport() {
+    // The Export view redraws when its data arrives, which would empty a file input; keep the chosen file in state.
+    var fileIn = h('input', { type: 'file', accept: '.json,application/json', class: 'input', 'aria-label': t('import_title'),
+      onchange: function () { S.importFile = fileIn.files && fileIn.files[0] || null; S.importResult = ''; render(); } });
+    var btn = h('button', { class: 'btn small', type: 'button', disabled: S.importBusy }, t('import_btn'));
+    btn.addEventListener('click', function () {
+      var f = S.importFile;
+      if (!f) { toast(t('import_choose'), true); return; }
+      var reader = new FileReader();
+      reader.onload = function () {
+        var data;
+        try { data = JSON.parse(reader.result); } catch (e) { toast(t('import_bad'), true); return; }
+        S.importBusy = true; S.importResult = t('loading'); render();
+        api('import', null, data).then(function (r) {
+          S.importResult = t('import_done', { w: r.workoutsAdded, s: r.setsAdded, e: r.exercisesAdded, t: r.templatesAdded, k: r.workoutsSkipped });
+          S.importFile = null; S.history = null; S.stats = null; S.exp = null;
+          return refreshStart();
+        }).catch(function (e) { S.importResult = ''; fail(e); }).then(function () { S.importBusy = false; if (S.tab === 'export') render(); });
+      };
+      reader.readAsText(f);
+    });
+    return h('div', { class: 'section stack' }, h('h2', { text: t('import_title') }),
+      h('p', { class: 'muted small', text: t('import_help') }), fileIn,
+      S.importFile ? h('p', { class: 'small', text: S.importFile.name }) : null,
+      btn, h('p', { class: 'small', role: 'status', text: S.importResult || '' }));
   }
 
   function renderDevicesSettings() {

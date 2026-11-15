@@ -162,6 +162,24 @@ public static class Db
 
         @"IF OBJECT_ID('dbo.app_state') IS NULL CREATE TABLE dbo.app_state (
             [key] NVARCHAR(50) PRIMARY KEY,
-            [value] NVARCHAR(200) NOT NULL)"
+            [value] NVARCHAR(200) NOT NULL)",
+
+        // Body weight history: one value per day, kept separately from workouts.
+        @"IF OBJECT_ID('dbo.body_weights') IS NULL CREATE TABLE dbo.body_weights (
+            id INT IDENTITY PRIMARY KEY,
+            [date] DATE NOT NULL UNIQUE,
+            weight_kg DECIMAL(5,2) NOT NULL,
+            updated_at DATETIME2 NOT NULL)",
+
+        // One-time copy of body weights that were saved on workouts before the history table existed.
+        @"IF NOT EXISTS (SELECT 1 FROM dbo.app_state WHERE [key] = 'bw_backfilled')
+          BEGIN
+            INSERT INTO dbo.body_weights ([date], weight_kg, updated_at)
+              SELECT w.[date], MAX(w.body_weight_kg), SYSUTCDATETIME() FROM dbo.workouts w
+              WHERE w.body_weight_kg IS NOT NULL
+                AND NOT EXISTS (SELECT 1 FROM dbo.body_weights b WHERE b.[date] = w.[date])
+              GROUP BY w.[date];
+            INSERT INTO dbo.app_state ([key], [value]) VALUES ('bw_backfilled', '1');
+          END"
     };
 }
