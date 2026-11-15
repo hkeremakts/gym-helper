@@ -18,8 +18,19 @@ public class CheckHandler : IHttpHandler
     {
         StringBuilder sb = new StringBuilder();
         bool hasConn = Settings.ConnectionString.Length > 0;
-        bool hasKey = Settings.EnrollKey.Length > 0;
-        sb.AppendLine("Settings file found: " + (hasConn || hasKey ? "yes" : "NO (App_Data\\settings.config missing, misnamed, or not valid XML)"));
+        string err = Settings.LoadError;
+        sb.AppendLine("Settings file: " + (err == null ? "read OK" : "PROBLEM — " + err));
+        if (err != null)
+        {
+            // File names only (never contents), to catch things like settings.config.txt
+            try
+            {
+                string dir = System.IO.Path.GetDirectoryName(Settings.FilePath);
+                sb.AppendLine("Files in App_Data: " + string.Join(", ", System.Array.ConvertAll(System.IO.Directory.GetFiles(dir), f => System.IO.Path.GetFileName(f))));
+            }
+            catch (Exception) { sb.AppendLine("Files in App_Data: (could not list)"); }
+        }
+        else sb.AppendLine("Keys found: " + string.Join(", ", new System.Collections.Generic.List<string>(Settings.KeysFound).ToArray()));
 
         string key = Http.Q(ctx, "key");
         if (string.IsNullOrEmpty(key)) { Http.Text(ctx, 200, sb.ToString()); return; }
