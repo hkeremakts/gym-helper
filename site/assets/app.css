@@ -143,6 +143,13 @@ label.field > span { display: block; font-size: 0.87rem; color: var(--muted); ma
   border: 1px solid var(--line); border-radius: 8px; background: var(--surface);
 }
 .textarea { min-height: 64px; resize: vertical; line-height: 1.4; }
+/* iOS Safari gives date inputs their own minimum width, height and centred text; make them behave like the other fields. */
+input[type="date"].input {
+  -webkit-appearance: none; appearance: none;
+  display: block; min-width: 0; max-width: 100%; height: var(--tap); line-height: normal;
+}
+input[type="date"].input::-webkit-date-and-time-value { text-align: left; margin: 0; }
+input[type="date"].input::-webkit-datetime-edit { padding: 0; }
 .input::placeholder, .textarea::placeholder { color: color-mix(in srgb, var(--muted) 80%, transparent); }
 .input:focus, .select:focus, .textarea:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
 
@@ -162,7 +169,8 @@ label.field > span { display: block; font-size: 0.87rem; color: var(--muted); ma
 /* ---- Start screen ---- */
 .lastline { font-size: 1.05rem; }
 .lastline strong { font-weight: 650; }
-.start-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.start-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
+.start-grid > * { min-width: 0; }
 
 /* ---- Workout ---- */
 .wo-head { margin-bottom: 14px; }
