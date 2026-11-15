@@ -60,6 +60,11 @@ public class CheckHandler : IHttpHandler
             using (var conn = Db.Open())
             {
                 sb.AppendLine("Database: connected, tables ready");
+                sb.AppendLine("Workouts: " + Db.Scalar(conn, null, "SELECT COUNT(*) FROM workouts")
+                    + "   exercises: " + Db.Scalar(conn, null, "SELECT COUNT(*) FROM exercises")
+                    + "   templates: " + Db.Scalar(conn, null, "SELECT COUNT(*) FROM templates")
+                    + "   sets: " + Db.Scalar(conn, null, "SELECT COUNT(*) FROM sets")
+                    + "   body weights: " + Db.Scalar(conn, null, "SELECT COUNT(*) FROM body_weights"));
                 sb.AppendLine("Enrolled devices: " + Db.Scalar(conn, null, "SELECT COUNT(*) FROM devices"));
                 foreach (var r in Db.Rows(conn, null, "SELECT id, label, created_at, last_seen_at FROM devices ORDER BY id"))
                     sb.AppendLine("  #" + r["id"] + " " + r["label"] + "  created " + Http.UtcStr(r["created_at"]) + "  last seen " + (Http.UtcStr(r["last_seen_at"]) ?? "never"));
@@ -74,6 +79,18 @@ public class CheckHandler : IHttpHandler
         {
             sb.AppendLine("Database: FAILED — " + e.Message);
         }
+        try
+        {
+            string log = System.IO.Path.Combine(HttpRuntime.AppDomainAppPath, "App_Data", "errors.log");
+            if (System.IO.File.Exists(log))
+            {
+                string[] lines = System.IO.File.ReadAllLines(log);
+                sb.AppendLine("Last lines of App_Data\\errors.log:");
+                for (int i = Math.Max(0, lines.Length - 12); i < lines.Length; i++) sb.AppendLine("  " + lines[i]);
+            }
+            else sb.AppendLine("errors.log: none");
+        }
+        catch (Exception e) { sb.AppendLine("errors.log: could not read (" + e.GetType().Name + ")"); }
         Http.Text(ctx, 200, sb.ToString());
     }
 
