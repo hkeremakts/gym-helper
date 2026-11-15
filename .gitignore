@@ -1,0 +1,8 @@
+# Secrets and runtime data: never commit
+site/App_Data/*
+!site/App_Data/settings.example.config
+
+# Local tooling
+.claude/
+node_modules/
+.DS_Store
